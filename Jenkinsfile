@@ -18,7 +18,9 @@ pipeline {
         // GitHub webhook trigger - Jenkins will automatically trigger on push/PR events
         githubPush()
         
-        // Optional: Poll SCM as fallback (H/15 * * * * means every 15 minutes)
+        // Optional: Poll SCM as fallback
+        // 'H' provides hash-based distribution to avoid load spikes
+        // Example: 'H/15 * * * *' checks every 15 minutes at a consistent offset
         // pollSCM('H/15 * * * *')
     }
     
@@ -329,10 +331,13 @@ EOF
                 echo "Performing cleanup..."
             }
             
-            // Cleanup temporary files
+            // Cleanup temporary files (only if they exist)
             sh '''
-                # Clean up temporary files but keep results
-                rm -rf ${WORKSPACE}/tmp/* || true
+                # Clean up any temporary files created during the build
+                # Preserves results directory
+                if [ -d "${WORKSPACE}/tmp" ]; then
+                    rm -rf ${WORKSPACE}/tmp/* || true
+                fi
             '''
         }
     }
