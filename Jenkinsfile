@@ -2,7 +2,6 @@ pipeline {
   agent { label "${params.AGENT_LABEL}" }
   options { 
     timestamps()
-    ansiColor('xterm')
   }
 
   parameters {
