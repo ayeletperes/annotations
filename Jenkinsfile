@@ -15,7 +15,7 @@ pipeline {
     // Nextflow Parameters
     string(name: 'NEXTFLOW_PIPELINE', defaultValue: 'nf-core/airrflow', description: 'Nextflow pipeline to run')
     string(name: 'NEXTFLOW_VERSION', defaultValue: '4.3.1', description: 'Pipeline version/revision')
-    string(name: 'NEXTFLOW_PROFILE', defaultValue: 'test,docker', description: 'Nextflow profiles (comma-separated)')
+    string(name: 'NEXTFLOW_PROFILE', defaultValue: 'test,mccleary', description: 'Nextflow profiles (comma-separated)')
     string(name: 'NEXTFLOW_CONFIG', defaultValue: '', description: 'Additional Nextflow config file (optional)')
     text(name: 'NEXTFLOW_PARAMS', defaultValue: '', description: 'Additional Nextflow parameters (one per line, format: --param value)')
     
