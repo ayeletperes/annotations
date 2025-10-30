@@ -2,12 +2,14 @@ pipeline {
   agent { label "${params.AGENT_LABEL}" }
   options { 
     timestamps()
+    ansiColor('xterm')
   }
 
   parameters {
     // Execution Parameters
     string(name: 'TASKS', defaultValue: 'run-A,run-B', description: 'Comma separated run names')
-    choice(name: 'EXECUTION_MODE', choices: ['slurm_array', 'jenkins_parallel', 'jenkins_sequential'], description: 'Execution strategy')
+    choice(name: 'EXECUTION_MODE', choices: ['slurm_array', 'jenkins_parallel', 'jenkins_sequential'], 
+           description: 'How to submit to SLURM: array (SLURM manages), parallel (Jenkins submits multiple), or sequential (Jenkins submits one-by-one)')
     string(name: 'MAX_CONCURRENCY', defaultValue: '5', description: 'Max concurrent jobs (for array and parallel modes)')
     
     // Nextflow Parameters
@@ -21,7 +23,7 @@ pipeline {
     string(name: 'SCRATCH_BASE', defaultValue: '${SCRATCH_DIR}/jenkins-runs', description: 'Base scratch directory (use ${SCRATCH_DIR} for user scratch)')
     string(name: 'OUTPUT_BASE', defaultValue: '${SCRATCH_DIR}/nextflow-outputs', description: 'Base output directory')
     
-    // SLURM Parameters
+    // SLURM Parameters (used by ALL execution modes!)
     string(name: 'SLURM_PARTITION', defaultValue: 'general', description: 'SLURM partition')
     string(name: 'SLURM_TIME', defaultValue: '12:00:00', description: 'SLURM time limit')
     string(name: 'SLURM_CPUS', defaultValue: '5', description: 'CPUs per task')
@@ -56,6 +58,17 @@ pipeline {
           if (params.ONLY_MONITOR && !params.EXISTING_JOB_ID?.trim()) {
             error "ONLY_MONITOR requires EXISTING_JOB_ID"
           }
+          
+          echo """
+          ========================================
+          Execution Mode: ${params.EXECUTION_MODE}
+          ========================================
+          ALL modes submit to SLURM:
+          - slurm_array: Single array job, SLURM manages parallelism
+          - jenkins_parallel: Multiple individual SLURM jobs in parallel
+          - jenkins_sequential: Individual SLURM jobs one at a time
+          ========================================
+          """
         }
       }
     }
@@ -66,7 +79,7 @@ pipeline {
         sh '''#!/usr/bin/env bash
           set -euo pipefail
           echo "Setting up directories..."
-          echo "Base working directory: ${BASE_WD}"
+          echo "Base working directory: ${BASE_WD}/${RUN_ID}"
           echo "Output directory: ${OUTPUT_DIR}"
           mkdir -p "${BASE_WD}/${RUN_ID}"
           mkdir -p "${OUTPUT_DIR}"
@@ -74,33 +87,22 @@ pipeline {
       }
     }
 
-    stage('Submit Jobs') {
+    stage('Submit Jobs to SLURM') {
       when { expression { !params.ONLY_MONITOR } }
-      parallel {
-        stage('SLURM Array Submission') {
-          when { expression { params.EXECUTION_MODE == 'slurm_array' } }
-          steps {
-            script {
-              submitSlurmArray()
-            }
-          }
-        }
-        
-        stage('Jenkins Parallel Submission') {
-          when { expression { params.EXECUTION_MODE == 'jenkins_parallel' } }
-          steps {
-            script {
-              runJenkinsParallel()
-            }
-          }
-        }
-        
-        stage('Jenkins Sequential Submission') {
-          when { expression { params.EXECUTION_MODE == 'jenkins_sequential' } }
-          steps {
-            script {
-              runJenkinsSequential()
-            }
+      steps {
+        script {
+          def names = params.TASKS.split(/\s*,\s*/).findAll { it }
+          
+          switch(params.EXECUTION_MODE) {
+            case 'slurm_array':
+              submitSlurmArray(names)
+              break
+            case 'jenkins_parallel':
+              submitJenkinsParallelSlurm(names)
+              break
+            case 'jenkins_sequential':
+              submitJenkinsSequentialSlurm(names)
+              break
           }
         }
       }
@@ -109,7 +111,7 @@ pipeline {
     stage('Monitor Jobs') {
       when { 
         expression { 
-          params.ONLY_MONITOR || (params.AUTO_MONITOR && params.EXECUTION_MODE == 'slurm_array')
+          params.ONLY_MONITOR || params.AUTO_MONITOR
         } 
       }
       steps {
@@ -152,21 +154,93 @@ pipeline {
   }
 }
 
-// Function to submit SLURM array
-def submitSlurmArray() {
-  def names = params.TASKS.split(/\s*,\s*/).findAll { it }
+// ============================================
+// SLURM SCRIPT GENERATOR
+// ============================================
+def generateSlurmScript(taskName = null, arraySpec = null) {
+  def nfParams = params.NEXTFLOW_PARAMS?.trim()?.split('\n')?.findAll{it}?.join(' ') ?: ''
+  def accountLine = params.SLURM_ACCOUNT?.trim() ? "#SBATCH --account=${params.SLURM_ACCOUNT}" : ""
+  
+  def isArray = (arraySpec && arraySpec != "1")
+  def arrayLine = arraySpec ? "#SBATCH --array=${arraySpec}" : ""
+  
+  return """#!/usr/bin/env bash
+#SBATCH --job-name=nf-${taskName ?: 'array'}-${env.RUN_ID}
+#SBATCH --output=slurm-%A${isArray ? '_%a' : ''}.out
+#SBATCH --error=slurm-%A${isArray ? '_%a' : ''}.err
+#SBATCH --time=${params.SLURM_TIME}
+#SBATCH --cpus-per-task=${params.SLURM_CPUS}
+#SBATCH --mem-per-cpu=${params.SLURM_MEM}
+#SBATCH --partition=${params.SLURM_PARTITION}
+${arrayLine}
+${accountLine}
+
+set -euo pipefail
+
+echo "Starting on host: \$(hostname)"
+echo "Job ID: \${SLURM_JOB_ID}${isArray ? ', Array Task: \${SLURM_ARRAY_TASK_ID}' : ''}"
+
+# Load modules if specified
+${params.JAVA_MODULE?.trim() ? "module load ${params.JAVA_MODULE} || true" : ""}
+
+# Determine task name
+${isArray ? '''
+# Array job: get task name from file
+TASKS_FILE="${SLURM_SUBMIT_DIR}/tasks.tsv"
+TASK_NAME=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "${TASKS_FILE}" | tr -d '\\r\\n')
+if [ -z "${TASK_NAME}" ]; then
+  echo "ERROR: No task found at index ${SLURM_ARRAY_TASK_ID}"
+  exit 1
+fi
+''' : """
+# Single job: task name is predefined
+TASK_NAME="${taskName}"
+"""}
+
+# Setup directories
+WORK_DIR="\${SLURM_SUBMIT_DIR}/\${TASK_NAME}"
+OUT_DIR="${env.OUTPUT_DIR}/\${TASK_NAME}"
+mkdir -p "\${WORK_DIR}" "\${OUT_DIR}"
+
+echo "Running task: \${TASK_NAME}"
+echo "Work directory: \${WORK_DIR}"
+echo "Output directory: \${OUT_DIR}"
+
+# Run Nextflow
+cd "\${WORK_DIR}"
+nextflow run ${params.NEXTFLOW_PIPELINE} \\
+  -r ${params.NEXTFLOW_VERSION} \\
+  -profile ${params.NEXTFLOW_PROFILE} \\
+  ${params.NEXTFLOW_CONFIG?.trim() ? "-c ${params.NEXTFLOW_CONFIG}" : ""} \\
+  --outdir "\${OUT_DIR}" \\
+  -work-dir "\${WORK_DIR}" \\
+  -with-report "\${WORK_DIR}/report.html" \\
+  -with-trace "\${WORK_DIR}/trace.txt" \\
+  -with-timeline "\${WORK_DIR}/timeline.html" \\
+  ${nfParams}
+
+EXIT_CODE=\$?
+echo "Task \${TASK_NAME} completed with exit code: \${EXIT_CODE}"
+exit \${EXIT_CODE}
+"""
+}
+
+// ============================================
+// SLURM ARRAY SUBMISSION
+// ============================================
+def submitSlurmArray(names) {
   int N = names.size()
   int CONC = params.MAX_CONCURRENCY.toInteger()
   if (CONC > N) CONC = N
   
   String arraySpec = (N > 1) ? "1-${N}%${CONC}" : "1"
-  echo "Submitting SLURM array with spec: ${arraySpec}"
+  echo "Submitting SLURM array job for ${N} tasks with spec: ${arraySpec}"
   
   // Write tasks file
   writeFile file: "tasks.tsv", text: names.join("\n") + "\n"
   
-  // Build SLURM script
-  def slurmScript = generateSlurmScript(arraySpec)
+  // Generate SLURM script using unified function
+  def slurmScript = generateSlurmScript(null, arraySpec)
   writeFile file: "array_job.slurm", text: slurmScript
   
   sh '''#!/usr/bin/env bash
@@ -174,8 +248,7 @@ def submitSlurmArray() {
     
     # Copy files to run directory
     RUN_DIR="${BASE_WD}/${RUN_ID}"
-    cp tasks.tsv "${RUN_DIR}/"
-    cp array_job.slurm "${RUN_DIR}/"
+    cp tasks.tsv array_job.slurm "${RUN_DIR}/"
     
     # Submit from run directory
     cd "${RUN_DIR}"
@@ -192,131 +265,120 @@ def submitSlurmArray() {
     # Save job info
     cd -
     echo "SLURM_ARRAY:${JOB_ID}:${RUN_DIR}" > .job_status
-    echo "Submitted SLURM array job: ${JOB_ID}"
+    echo "✓ Submitted SLURM array job: ${JOB_ID}"
   '''
 }
 
-def generateSlurmScript(arraySpec) {
-  def nfParams = params.NEXTFLOW_PARAMS?.trim()?.split('\n')?.findAll{it}?.join(' ') ?: ''
-  def accountLine = params.SLURM_ACCOUNT?.trim() ? "#SBATCH --account=${params.SLURM_ACCOUNT}" : ""
-  
-  return """#!/usr/bin/env bash
-#SBATCH --job-name=nf-array-${env.RUN_ID}
-#SBATCH --output=slurm-%A_%a.out
-#SBATCH --error=slurm-%A_%a.err
-#SBATCH --time=${params.SLURM_TIME}
-#SBATCH --cpus-per-task=${params.SLURM_CPUS}
-#SBATCH --mem-per-cpu=${params.SLURM_MEM}
-#SBATCH --partition=${params.SLURM_PARTITION}
-#SBATCH --array=${arraySpec}
-${accountLine}
-
-set -euo pipefail
-
-# Load modules if specified
-${params.JAVA_MODULE?.trim() ? "module load ${params.JAVA_MODULE} || true" : ""}
-
-# Get task name
-TASKS_FILE="\${SLURM_SUBMIT_DIR}/tasks.tsv"
-TASK_NAME=\$(sed -n "\${SLURM_ARRAY_TASK_ID}p" "\${TASKS_FILE}" | tr -d '\\r\\n')
-
-if [ -z "\${TASK_NAME}" ]; then
-  echo "ERROR: No task found at index \${SLURM_ARRAY_TASK_ID}"
-  exit 1
-fi
-
-# Setup directories
-WORK_DIR="\${SLURM_SUBMIT_DIR}/\${TASK_NAME}"
-OUT_DIR="${env.OUTPUT_DIR}/\${TASK_NAME}"
-mkdir -p "\${WORK_DIR}" "\${OUT_DIR}"
-
-echo "[\${SLURM_JOB_ID}.\${SLURM_ARRAY_TASK_ID}] Running: \${TASK_NAME}"
-echo "Work directory: \${WORK_DIR}"
-echo "Output directory: \${OUT_DIR}"
-
-# Run Nextflow
-nextflow run ${params.NEXTFLOW_PIPELINE} \\
-  -r ${params.NEXTFLOW_VERSION} \\
-  -profile ${params.NEXTFLOW_PROFILE} \\
-  ${params.NEXTFLOW_CONFIG?.trim() ? "-c ${params.NEXTFLOW_CONFIG}" : ""} \\
-  --outdir "\${OUT_DIR}" \\
-  -work-dir "\${WORK_DIR}" \\
-  -with-report "\${WORK_DIR}/report.html" \\
-  -with-trace "\${WORK_DIR}/trace.txt" \\
-  -with-timeline "\${WORK_DIR}/timeline.html" \\
-  ${nfParams}
-
-echo "Task \${TASK_NAME} completed with exit code: \$?"
-"""
-}
-
-def runJenkinsParallel() {
-  def names = params.TASKS.split(/\s*,\s*/).findAll { it }
+// ============================================
+// JENKINS PARALLEL SLURM SUBMISSION
+// ============================================
+def submitJenkinsParallelSlurm(names) {
   def parallelTasks = [:]
+  def jobIds = Collections.synchronizedList([])
+  
+  echo "Submitting ${names.size()} individual SLURM jobs in parallel"
   
   names.each { taskName ->
     parallelTasks[taskName] = {
-      stage("Run ${taskName}") {
-        runNextflowTask(taskName)
+      stage("Submit: ${taskName}") {
+        // Generate script for single task using unified function
+        def slurmScript = generateSlurmScript(taskName, null)
+        writeFile file: "${taskName}.slurm", text: slurmScript
+        
+        def jobId = sh(
+          script: """#!/usr/bin/env bash
+            set -euo pipefail
+            RUN_DIR="${env.BASE_WD}/${env.RUN_ID}"
+            cp "${taskName}.slurm" "\${RUN_DIR}/"
+            cd "\${RUN_DIR}"
+            sbatch "${taskName}.slurm" | awk '/Submitted batch job/ {print \$4}'
+          """,
+          returnStdout: true
+        ).trim()
+        
+        jobIds.add(jobId)
+        echo "✓ Submitted SLURM job ${jobId} for ${taskName}"
       }
     }
   }
   
-  // Limit concurrency
-  def maxConcurrent = params.MAX_CONCURRENCY.toInteger()
-  if (parallelTasks.size() > maxConcurrent) {
-    echo "Running ${parallelTasks.size()} tasks with max concurrency of ${maxConcurrent}"
-  }
-  
+  // Run submissions in parallel
   parallel parallelTasks
+  
+  // Save all job IDs
+  writeFile file: ".job_status", text: "SLURM_INDIVIDUAL:${jobIds.join(',')}:${env.BASE_WD}/${env.RUN_ID}\n"
+  echo "All ${jobIds.size()} SLURM jobs submitted: ${jobIds.join(', ')}"
 }
 
-def runJenkinsSequential() {
-  def names = params.TASKS.split(/\s*,\s*/).findAll { it }
+// ============================================
+// JENKINS SEQUENTIAL SLURM SUBMISSION
+// ============================================
+def submitJenkinsSequentialSlurm(names) {
+  def jobIds = []
+  
+  echo "Submitting ${names.size()} SLURM jobs sequentially"
   
   names.each { taskName ->
-    stage("Run ${taskName}") {
-      runNextflowTask(taskName)
+    stage("Submit: ${taskName}") {
+      // Generate script for single task using unified function
+      def slurmScript = generateSlurmScript(taskName, null)
+      writeFile file: "${taskName}.slurm", text: slurmScript
+      
+      def jobId = sh(
+        script: """#!/usr/bin/env bash
+          set -euo pipefail
+          RUN_DIR="${env.BASE_WD}/${env.RUN_ID}"
+          cp "${taskName}.slurm" "\${RUN_DIR}/"
+          cd "\${RUN_DIR}"
+          sbatch "${taskName}.slurm" | awk '/Submitted batch job/ {print \$4}'
+        """,
+        returnStdout: true
+      ).trim()
+      
+      jobIds.add(jobId)
+      echo "✓ Submitted SLURM job ${jobId} for ${taskName}"
+      
+      // Wait for completion before submitting next
+      if (params.AUTO_MONITOR && names.size() > 1) {
+        echo "Waiting for ${taskName} to complete..."
+        sh """#!/usr/bin/env bash
+          while true; do
+            STATE=\$(sacct -j ${jobId} --format=State -n -P | head -1)
+            case "\$STATE" in
+              COMPLETED)
+                echo "✓ Job ${jobId} completed successfully"
+                break
+                ;;
+              FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY)
+                echo "✗ Job ${jobId} failed with state: \$STATE"
+                exit 1
+                ;;
+              RUNNING)
+                echo "  Job ${jobId} is running..."
+                sleep 30
+                ;;
+              PENDING)
+                echo "  Job ${jobId} is pending..."
+                sleep 10
+                ;;
+              *)
+                sleep 10
+                ;;
+            esac
+          done
+        """
+      }
     }
   }
+  
+  // Save all job IDs
+  writeFile file: ".job_status", text: "SLURM_INDIVIDUAL:${jobIds.join(',')}:${env.BASE_WD}/${env.RUN_ID}\n"
+  echo "All ${jobIds.size()} SLURM jobs submitted sequentially: ${jobIds.join(', ')}"
 }
 
-def runNextflowTask(taskName) {
-  sh """#!/usr/bin/env bash
-    set -euo pipefail
-    
-    # Setup directories
-    WORK_DIR="${env.BASE_WD}/${env.RUN_ID}/${taskName}"
-    OUT_DIR="${env.OUTPUT_DIR}/${taskName}"
-    mkdir -p "\${WORK_DIR}" "\${OUT_DIR}"
-    
-    echo "Running Nextflow task: ${taskName}"
-    
-    # Load modules if needed
-    ${params.JAVA_MODULE?.trim() ? "module load ${params.JAVA_MODULE} || true" : ""}
-    
-    # Parse additional parameters
-    NF_PARAMS=""
-    if [ -n "${params.NEXTFLOW_PARAMS?.trim() ?: ''}" ]; then
-      NF_PARAMS="${params.NEXTFLOW_PARAMS.trim().split('\n').join(' ')}"
-    fi
-    
-    # Run Nextflow
-    nextflow run ${params.NEXTFLOW_PIPELINE} \\
-      -r ${params.NEXTFLOW_VERSION} \\
-      -profile ${params.NEXTFLOW_PROFILE} \\
-      ${params.NEXTFLOW_CONFIG?.trim() ? "-c ${params.NEXTFLOW_CONFIG}" : ""} \\
-      --outdir "\${OUT_DIR}" \\
-      -work-dir "\${WORK_DIR}" \\
-      -with-report "\${WORK_DIR}/report.html" \\
-      -with-trace "\${WORK_DIR}/trace.txt" \\
-      -with-timeline "\${WORK_DIR}/timeline.html" \\
-      \${NF_PARAMS}
-    
-    echo "Task ${taskName} completed"
-  """
-}
-
+// ============================================
+// JOB MONITORING
+// ============================================
 def monitorJobs() {
   sh '''#!/usr/bin/env bash
     set -euo pipefail
@@ -325,98 +387,129 @@ def monitorJobs() {
     if [ -f ".job_status" ]; then
       JOB_INFO=$(cat .job_status)
     elif [ -n "${EXISTING_JOB_ID:-}" ]; then
-      JOB_INFO="SLURM_ARRAY:${EXISTING_JOB_ID}:unknown"
+      if [[ "${EXISTING_JOB_ID}" =~ , ]]; then
+        JOB_INFO="SLURM_INDIVIDUAL:${EXISTING_JOB_ID}:unknown"
+      else
+        JOB_INFO="SLURM_ARRAY:${EXISTING_JOB_ID}:unknown"
+      fi
     else
       echo "No job information found"
       exit 1
     fi
     
     JOB_TYPE=$(echo "$JOB_INFO" | cut -d: -f1)
-    JOB_ID=$(echo "$JOB_INFO" | cut -d: -f2)
+    JOB_IDS=$(echo "$JOB_INFO" | cut -d: -f2)
+    RUN_DIR=$(echo "$JOB_INFO" | cut -d: -f3)
     
-    if [ "$JOB_TYPE" != "SLURM_ARRAY" ]; then
-      echo "Monitoring only supported for SLURM arrays currently"
-      exit 0
-    fi
+    echo "Monitoring ${JOB_TYPE} jobs: ${JOB_IDS}"
     
-    echo "Monitoring SLURM array job: ${JOB_ID}"
-    
-    # Monitor loop
-    declare -A TASK_STATUS
-    POLL_INTERVAL=30
-    MAX_POLLS=720  # 6 hours with 30s interval
-    POLL_COUNT=0
-    
-    while [ $POLL_COUNT -lt $MAX_POLLS ]; do
-      echo "=== Poll cycle $(date '+%Y-%m-%d %H:%M:%S') ==="
-      
-      # Query job status
-      JOB_DATA=$(sacct -j "${JOB_ID}" --format=JobID,JobName,State,ExitCode,Elapsed -P -n 2>/dev/null || true)
-      
-      if [ -z "$JOB_DATA" ]; then
-        echo "No job data available yet..."
-        sleep $POLL_INTERVAL
-        POLL_COUNT=$((POLL_COUNT + 1))
-        continue
-      fi
-      
-      TOTAL_TASKS=0
-      COMPLETED_TASKS=0
-      FAILED_TASKS=0
-      RUNNING_TASKS=0
-      
-      while IFS='|' read -r jobid name state exitcode elapsed; do
-        if [[ "$jobid" =~ ^${JOB_ID}_[0-9]+$ ]]; then
-          TOTAL_TASKS=$((TOTAL_TASKS + 1))
-          TASK_NUM="${jobid##*_}"
+    # Monitor based on job type
+    if [ "$JOB_TYPE" = "SLURM_ARRAY" ]; then
+      # Monitor single array job
+      monitor_array_job() {
+        local JOB_ID=$1
+        declare -A TASK_STATUS
+        
+        while true; do
+          echo "=== Status check $(date '+%H:%M:%S') ==="
           
-          # Track state changes
-          OLD_STATE="${TASK_STATUS[$TASK_NUM]:-NEW}"
-          if [ "$OLD_STATE" != "$state" ]; then
-            echo "  Task ${TASK_NUM}: ${OLD_STATE} -> ${state} (elapsed: ${elapsed})"
-            TASK_STATUS[$TASK_NUM]="$state"
+          TOTAL=0
+          COMPLETED=0
+          FAILED=0
+          RUNNING=0
+          PENDING=0
+          
+          # Get all array tasks
+          while IFS='|' read -r jobid state; do
+            if [[ "$jobid" =~ ^${JOB_ID}_[0-9]+$ ]]; then
+              TOTAL=$((TOTAL + 1))
+              TASK_NUM="${jobid##*_}"
+              
+              # Track state changes
+              OLD_STATE="${TASK_STATUS[$TASK_NUM]:-NEW}"
+              if [ "$OLD_STATE" != "$state" ]; then
+                echo "  Task ${TASK_NUM}: ${OLD_STATE} -> ${state}"
+                TASK_STATUS[$TASK_NUM]="$state"
+              fi
+              
+              case "$state" in
+                COMPLETED) ((COMPLETED++)) ;;
+                FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY) 
+                  ((FAILED++))
+                  echo "  ⚠️ Task ${TASK_NUM} failed: ${state}"
+                  ;;
+                RUNNING) ((RUNNING++)) ;;
+                PENDING) ((PENDING++)) ;;
+              esac
+            fi
+          done < <(sacct -j "${JOB_ID}" --format=JobID,State -P -n 2>/dev/null || true)
+          
+          echo "Summary: Total=${TOTAL}, Running=${RUNNING}, Pending=${PENDING}, Completed=${COMPLETED}, Failed=${FAILED}"
+          
+          if [ $TOTAL -gt 0 ] && [ $((COMPLETED + FAILED)) -eq $TOTAL ]; then
+            echo "All tasks completed!"
+            [ $FAILED -gt 0 ] && exit 1
+            break
           fi
           
-          case "$state" in
-            RUNNING)
-              RUNNING_TASKS=$((RUNNING_TASKS + 1))
-              ;;
-            COMPLETED)
-              COMPLETED_TASKS=$((COMPLETED_TASKS + 1))
-              ;;
-            FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY)
-              FAILED_TASKS=$((FAILED_TASKS + 1))
-              echo "  ⚠️ Task ${TASK_NUM} failed with state: ${state}, exit code: ${exitcode}"
-              ;;
-          esac
-        fi
-      done <<< "$JOB_DATA"
+          sleep 30
+        done
+      }
       
-      echo "Summary: Total=${TOTAL_TASKS}, Running=${RUNNING_TASKS}, Completed=${COMPLETED_TASKS}, Failed=${FAILED_TASKS}"
+      monitor_array_job "$JOB_IDS"
       
-      # Check if all tasks are done
-      DONE_TASKS=$((COMPLETED_TASKS + FAILED_TASKS))
-      if [ $TOTAL_TASKS -gt 0 ] && [ $DONE_TASKS -eq $TOTAL_TASKS ]; then
-        echo "All tasks have completed!"
+    else
+      # Monitor individual jobs
+      monitor_individual_jobs() {
+        IFS=',' read -ra JOB_ARRAY <<< "$1"
         
-        if [ $FAILED_TASKS -gt 0 ]; then
-          echo "WARNING: ${FAILED_TASKS} task(s) failed"
-          exit 1
-        fi
-        break
-      fi
+        while true; do
+          echo "=== Status check $(date '+%H:%M:%S') ==="
+          
+          COMPLETED=0
+          FAILED=0
+          RUNNING=0
+          PENDING=0
+          
+          for JOB_ID in "${JOB_ARRAY[@]}"; do
+            STATE=$(sacct -j "${JOB_ID}" --format=State -n -P | head -1 || echo "UNKNOWN")
+            
+            case "$STATE" in
+              COMPLETED) ((COMPLETED++)) ;;
+              FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY)
+                ((FAILED++))
+                echo "  ⚠️ Job ${JOB_ID} failed: ${STATE}"
+                ;;
+              RUNNING) ((RUNNING++)) ;;
+              PENDING) ((PENDING++)) ;;
+            esac
+          done
+          
+          TOTAL=${#JOB_ARRAY[@]}
+          echo "Summary: Total=${TOTAL}, Running=${RUNNING}, Pending=${PENDING}, Completed=${COMPLETED}, Failed=${FAILED}"
+          
+          if [ $((COMPLETED + FAILED)) -eq $TOTAL ]; then
+            echo "All jobs completed!"
+            [ $FAILED -gt 0 ] && exit 1
+            break
+          fi
+          
+          sleep 30
+        done
+      }
       
-      sleep $POLL_INTERVAL
-      POLL_COUNT=$((POLL_COUNT + 1))
-    done
-    
-    if [ $POLL_COUNT -ge $MAX_POLLS ]; then
-      echo "Monitoring timeout reached after $((MAX_POLLS * POLL_INTERVAL / 3600)) hours"
-      exit 1
+      monitor_individual_jobs "$JOB_IDS"
     fi
     
     echo ""
     echo "=== Final Job Summary ==="
-    sacct -j "${JOB_ID}" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS -n
+    if [ "$JOB_TYPE" = "SLURM_ARRAY" ]; then
+      sacct -j "${JOB_IDS}" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS -n
+    else
+      IFS=',' read -ra JOB_ARRAY <<< "$JOB_IDS"
+      for JOB_ID in "${JOB_ARRAY[@]}"; do
+        sacct -j "${JOB_ID}" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS -n
+      done
+    fi
   '''
 }
