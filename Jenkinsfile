@@ -381,8 +381,31 @@ def submitJenkinsSequentialSlurm(names) {
 // ============================================
 def monitorJobs() {
   sh '''#!/usr/bin/env bash
-    set -euo pipefail
-    
+    # Be strict on unset vars, but do not die on non-zero pipelines
+    set -u
+
+    # Helpers
+    have() { command -v "$1" >/dev/null 2>&1; }
+
+    get_job_state() {
+      # Args: JOB_ID
+      local J="$1" st=""
+      # Prefer sacct for terminal states
+      if have sacct; then
+        # Filter to the parent job or .batch step. Do not fail if sacct errors.
+        st=$(sacct -j "$J" --parsable2 --noheader -o JobID,State 2>/dev/null \
+              | awk -F'|' -v j="$J" '($1==j || $1 ~ "\\.batch$"){print $2}' \
+              | tail -n1 || true)
+      fi
+      # If sacct gave nothing, try squeue for live state
+      if [ -z "${st}" ] && have squeue; then
+        st=$(squeue -h -j "$J" -o "%T" 2>/dev/null | head -n1 || true)
+      fi
+      # Normalize and default
+      st=$(echo "${st:-UNKNOWN}" | tr '[:lower:]' '[:upper:]')
+      printf "%s" "$st"
+    }
+
     # Get job info
     if [ -f ".job_status" ]; then
       JOB_INFO=$(cat .job_status)
@@ -396,120 +419,109 @@ def monitorJobs() {
       echo "No job information found"
       exit 1
     fi
-    
+
     JOB_TYPE=$(echo "$JOB_INFO" | cut -d: -f1)
     JOB_IDS=$(echo "$JOB_INFO" | cut -d: -f2)
     RUN_DIR=$(echo "$JOB_INFO" | cut -d: -f3)
-    
+
     echo "Monitoring ${JOB_TYPE} jobs: ${JOB_IDS}"
-    
-    # Monitor based on job type
+
     if [ "$JOB_TYPE" = "SLURM_ARRAY" ]; then
-      # Monitor single array job
       monitor_array_job() {
         local JOB_ID=$1
         declare -A TASK_STATUS
-        
         while true; do
           echo "=== Status check $(date '+%H:%M:%S') ==="
-          
-          TOTAL=0
-          COMPLETED=0
-          FAILED=0
-          RUNNING=0
-          PENDING=0
-          
-          # Get all array tasks
-          while IFS='|' read -r jobid state; do
+          local TOTAL=0 COMPLETED=0 FAILED=0 RUNNING=0 PENDING=0
+
+          # Use sacct if present, else fall back to squeue listing of array tasks
+          if have sacct; then
+            MAPFILE -t lines < <(sacct -j "${JOB_ID}" --format=JobID,State -P -n 2>/dev/null || true)
+          else
+            MAPFILE -t lines < <(squeue -h -j "${JOB_ID}" -o "%i|%T" 2>/dev/null || true)
+          fi
+
+          for line in "${lines[@]}"; do
+            [ -n "$line" ] || continue
+            jobid="${line%%|*}"
+            state="${line#*|}"
             if [[ "$jobid" =~ ^${JOB_ID}_[0-9]+$ ]]; then
               TOTAL=$((TOTAL + 1))
               TASK_NUM="${jobid##*_}"
-              
-              # Track state changes
               OLD_STATE="${TASK_STATUS[$TASK_NUM]:-NEW}"
               if [ "$OLD_STATE" != "$state" ]; then
                 echo "  Task ${TASK_NUM}: ${OLD_STATE} -> ${state}"
                 TASK_STATUS[$TASK_NUM]="$state"
               fi
-              
-              case "$state" in
-                COMPLETED) ((COMPLETED++)) ;;
-                FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY) 
-                  ((FAILED++))
-                  echo "  ⚠️ Task ${TASK_NUM} failed: ${state}"
-                  ;;
+              case "${state^^}" in
+                COMPLETED|COMPLETING) ((COMPLETED++)) ;;
+                FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL)
+                  ((FAILED++)); echo "  Task ${TASK_NUM} failed: ${state}" ;;
                 RUNNING) ((RUNNING++)) ;;
-                PENDING) ((PENDING++)) ;;
+                PENDING|CONFIGURING|SUSPENDED) ((PENDING++)) ;;
+                *) : ;;
               esac
             fi
-          done < <(sacct -j "${JOB_ID}" --format=JobID,State -P -n 2>/dev/null || true)
-          
+          done
+
           echo "Summary: Total=${TOTAL}, Running=${RUNNING}, Pending=${PENDING}, Completed=${COMPLETED}, Failed=${FAILED}"
-          
+
           if [ $TOTAL -gt 0 ] && [ $((COMPLETED + FAILED)) -eq $TOTAL ]; then
-            echo "All tasks completed!"
+            echo "All tasks completed."
             [ $FAILED -gt 0 ] && exit 1
             break
           fi
-          
           sleep 30
         done
       }
-      
       monitor_array_job "$JOB_IDS"
-      
+
     else
-      # Monitor individual jobs
       monitor_individual_jobs() {
         IFS=',' read -ra JOB_ARRAY <<< "$1"
-        
+        local TOTAL=${#JOB_ARRAY[@]}
         while true; do
           echo "=== Status check $(date '+%H:%M:%S') ==="
-          
-          COMPLETED=0
-          FAILED=0
-          RUNNING=0
-          PENDING=0
-          
+          local COMPLETED=0 FAILED=0 RUNNING=0 PENDING=0
+
           for JOB_ID in "${JOB_ARRAY[@]}"; do
-            STATE=$(sacct -j "${JOB_ID}" --format=State -n -P | head -1 || echo "UNKNOWN")
-            
+            STATE="$(get_job_state "$JOB_ID")"
             case "$STATE" in
-              COMPLETED) ((COMPLETED++)) ;;
-              FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY)
-                ((FAILED++))
-                echo "  ⚠️ Job ${JOB_ID} failed: ${STATE}"
-                ;;
+              COMPLETED|COMPLETING) ((COMPLETED++)) ;;
+              FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL)
+                ((FAILED++)); echo "  Job ${JOB_ID} failed: ${STATE}" ;;
               RUNNING) ((RUNNING++)) ;;
-              PENDING) ((PENDING++)) ;;
+              PENDING|CONFIGURING|SUSPENDED) ((PENDING++)) ;;
+              UNKNOWN|"") : ;;  # neither sacct nor squeue know yet
             esac
           done
-          
-          TOTAL=${#JOB_ARRAY[@]}
+
           echo "Summary: Total=${TOTAL}, Running=${RUNNING}, Pending=${PENDING}, Completed=${COMPLETED}, Failed=${FAILED}"
-          
+
           if [ $((COMPLETED + FAILED)) -eq $TOTAL ]; then
-            echo "All jobs completed!"
+            echo "All jobs completed."
             [ $FAILED -gt 0 ] && exit 1
             break
           fi
-          
           sleep 30
         done
       }
-      
       monitor_individual_jobs "$JOB_IDS"
     fi
-    
-    echo ""
+
+    echo
     echo "=== Final Job Summary ==="
-    if [ "$JOB_TYPE" = "SLURM_ARRAY" ]; then
-      sacct -j "${JOB_IDS}" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS -n
+    if have sacct; then
+      if [ "$JOB_TYPE" = "SLURM_ARRAY" ]; then
+        sacct -j "${JOB_IDS}" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS -n || true
+      else
+        IFS=',' read -ra JOB_ARRAY <<< "$JOB_IDS"
+        for JOB_ID in "${JOB_ARRAY[@]}"; do
+          sacct -j "${JOB_ID}" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS -n || true
+        done
+      fi
     else
-      IFS=',' read -ra JOB_ARRAY <<< "$JOB_IDS"
-      for JOB_ID in "${JOB_ARRAY[@]}"; do
-        sacct -j "${JOB_ID}" --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS -n
-      done
+      echo "sacct not available. Skipping final sacct summary."
     fi
   '''
 }
